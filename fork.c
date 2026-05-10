@@ -100,7 +100,7 @@ static const key keys[] = {
     {ModMask, XK_Return, spawn, {.v = termcmd}},
 };
 
-static _Noreturn void die(const char *fmt, ...) PRINTF_FMT(1, 2) {
+static _Noreturn void die(const char *fmt, ...) {
   va_list ap;
   int saved_errno = errno;
 
