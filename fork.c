@@ -21,6 +21,12 @@
    (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL | XCB_MOD_MASK_1 |               \
     XCB_MOD_MASK_2 | XCB_MOD_MASK_3 | XCB_MOD_MASK_4 | XCB_MOD_MASK_5))
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PRINTF_FMT(a, b) __attribute__((format(printf, a, b)))
+#else
+#define PRINTF_FMT(a, b)
+#endif
+
 typedef struct client {
   xcb_window_t win;
   struct client *next;
@@ -62,7 +68,7 @@ static volatile sig_atomic_t running = 1;
 static unsigned int numlockmask;
 static void (*handler[256])(xcb_generic_event_t *);
 
-static _Noreturn void die(const char *fmt, ...);
+static _Noreturn void die(const char *fmt, ...) PRINTF_FMT(1, 2);
 static void *ecalloc(size_t nmemb, size_t size);
 static void spawn(const arg *args);
 static void keypress(xcb_key_press_event_t *e);
@@ -94,7 +100,7 @@ static const key keys[] = {
     {ModMask, XK_Return, spawn, {.v = termcmd}},
 };
 
-static _Noreturn void die(const char *fmt, ...) {
+static _Noreturn void die(const char *fmt, ...) PRINTF_FMT(1, 2) {
   va_list ap;
   int saved_errno = errno;
 
@@ -134,7 +140,7 @@ static void spawn(const arg *args) {
     sigaction(SIGCHLD, &sa, NULL);
 
     execvp(*((char **)args->v), (char **)args->v);
-    die("fork: execvp '%s' failed:", *((char **)args->v));
+    die("execvp '%s' failed:", *((char **)args->v));
   } else if (pid < 0)
     die("fork:");
 }
@@ -308,7 +314,14 @@ static void setup(void) {
   if (!glob->conn || xcb_connection_has_error(glob->conn))
     die("Failed to connect to X server");
 
-  glob->screen = xcb_setup_roots_iterator(xcb_get_setup(glob->conn)).data;
+  xcb_screen_iterator_t iter;
+
+  iter = xcb_setup_roots_iterator(xcb_get_setup(glob->conn));
+
+  for (int i = 0; i < glob->screen_no; i++)
+    xcb_screen_next(&iter);
+
+  glob->screen = iter.data;
 
   glob->atoms.wm_protocols = getatom("WM_PROTOCOLS");
   glob->atoms.wm_delete = getatom("WM_DELETE_WINDOW");
@@ -500,7 +513,7 @@ int main(int argc, char **argv) {
     die("usage: fork [-v]");
 
   if (!setlocale(LC_CTYPE, ""))
-    die("warning: no locale support");
+    fprintf(stderr, "warning: no locale support");
 
   setup();
 
