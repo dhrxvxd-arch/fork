@@ -13,6 +13,7 @@
 
 #define VERSION "0.1.0"
 #define EVENTTYPE(e) ((e)->response_type & ~0x80)
+#define ModMask XCB_MOD_MASK_4
 
 typedef struct client {
   xcb_window_t win;
@@ -27,19 +28,28 @@ typedef struct atoms {
 } atoms;
 
 typedef struct global {
-  xcb_connection_t *conn;
-  xcb_screen_t *screen;
   int screen_no;
   atoms atoms;
+	client *sel;
   client *clients;
+  xcb_connection_t *conn;
+  xcb_screen_t *screen;
 } global;
 
 global *glob;
+
+typedef union {
+	int i;
+	unsigned int ui;
+	float f;
+	const void *v;
+} arg;
 
 static void (*handler[256])(xcb_generic_event_t *);
 
 _Noreturn void die(const char *fmt, ...);
 void *ecalloc(size_t nmemb, size_t size);
+void spawn(const arg *args);
 void setup(void);
 void scan(void);
 void sigchld(int unused);
@@ -49,10 +59,12 @@ xcb_atom_t getatom(const char *restrict name);
 client *getclient(xcb_window_t win);
 void manage(xcb_window_t win);
 void unmanage(xcb_window_t win);
+void focus(client *c);
 void maprequest(xcb_map_request_event_t *e);
 void configurerequest(xcb_configure_request_event_t *e);
 void destroynotify(xcb_destroy_notify_event_t *e);
 void unmapnotify(xcb_unmap_notify_event_t *e);
+void enternotify(xcb_enter_notify_event_t *e);
 void run(void);
 void cleanup(void);
 int main(int argc, char **argv);
@@ -78,6 +90,24 @@ void *ecalloc(size_t nmemb, size_t size) {
   if (!(p = calloc(nmemb, size)))
     die("calloc:");
   return p;
+}
+
+void spawn(const arg *args) {
+  struct sigaction sa;
+
+  if (!fork()) {
+		if (glob->conn)
+			close(xcb_get_file_descriptor(glob->conn));
+    setsid();
+
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = SIG_DFL;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    execvp(*((char **)args->v), (char **)args->v);
+    die("fork: execvp '%s' failed:", *((char **)args->v));
+  }
 }
 
 void sigchld(int unused) {
@@ -194,6 +224,7 @@ void setup(void) {
       (void (*)(xcb_generic_event_t *))configurerequest;
   handler[XCB_DESTROY_NOTIFY] = (void (*)(xcb_generic_event_t *))destroynotify;
   handler[XCB_UNMAP_NOTIFY] = (void (*)(xcb_generic_event_t *))unmapnotify;
+	handler[XCB_ENTER_NOTIFY] = (void (*)(xcb_generic_event_t *))enternotify;
 
   xcb_flush(glob->conn);
 }
@@ -240,9 +271,24 @@ void startupscan(void) {
   free(reply);
 }
 
+void focus(client *c) {
+  if (!c)
+    return;
+
+  glob->sel = c;
+
+  xcb_set_input_focus(glob->conn, XCB_INPUT_FOCUS_POINTER_ROOT, c->win,
+                      XCB_CURRENT_TIME);
+
+  xcb_flush(glob->conn);
+}
+
 void maprequest(xcb_map_request_event_t *e) {
+	client *c; 
   manage(e->window);
   xcb_map_window(glob->conn, e->window);
+	if ((c = getclient(e->window)))
+		focus(c);
 }
 
 void configurerequest(xcb_configure_request_event_t *e) {
@@ -267,9 +313,20 @@ void configurerequest(xcb_configure_request_event_t *e) {
   xcb_configure_window(glob->conn, e->window, e->value_mask, values);
 }
 
-void destroynotify(xcb_destroy_notify_event_t *e) { unmanage(e->window); }
+void destroynotify(xcb_destroy_notify_event_t *e) { 
+	unmanage(e->window); 
+}
 
-void unmapnotify(xcb_unmap_notify_event_t *e) { unmanage(e->window); }
+void unmapnotify(xcb_unmap_notify_event_t *e) {
+	unmanage(e->window);
+}
+
+void enternotify(xcb_enter_notify_event_t *e) {
+  client *c;
+
+  if ((c = getclient(e->event)))
+    focus(c);
+}
 
 void run(void) {
   xcb_generic_event_t *ev;
