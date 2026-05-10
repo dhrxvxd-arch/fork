@@ -1,29 +1,61 @@
 #include <errno.h>
+#include <locale.h>
+#include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
 
 #define VERSION "0.1.0"
+#define EVENTTYPE(e) ((e)->response_type & ~0x80)
+
+typedef struct client {
+  xcb_window_t win;
+  struct client *next;
+} client;
+
+typedef struct atoms {
+  xcb_atom_t wm_protocols;
+  xcb_atom_t wm_delete;
+  xcb_atom_t net_active_window;
+  xcb_atom_t net_supported;
+} atoms;
+
+typedef struct global {
+  xcb_connection_t *conn;
+  xcb_screen_t *screen;
+  int screen_no;
+  atoms atoms;
+  client *clients;
+} global;
+
+global *glob;
+
+static void (*handler[256])(xcb_generic_event_t *);
 
 _Noreturn void die(const char *fmt, ...);
 void *ecalloc(size_t nmemb, size_t size);
 void setup(void);
 void scan(void);
+void sigchld(int unused);
+void sigterm(int unused);
+void startupscan(void);
+xcb_atom_t getatom(const char *restrict name);
+client *getclient(xcb_window_t win);
+void manage(xcb_window_t win);
+void unmanage(xcb_window_t win);
 void maprequest(xcb_map_request_event_t *e);
 void configurerequest(xcb_configure_request_event_t *e);
+void destroynotify(xcb_destroy_notify_event_t *e);
+void unmapnotify(xcb_unmap_notify_event_t *e);
 void run(void);
+void cleanup(void);
 int main(int argc, char **argv);
-
-typedef struct global {
-  xcb_connection_t *conn;
-  xcb_screen_t *screen;
-} global;
-
-global *glob;
 
 _Noreturn void die(const char *fmt, ...) {
   va_list ap;
@@ -48,15 +80,120 @@ void *ecalloc(size_t nmemb, size_t size) {
   return p;
 }
 
-void setup(void) {
-  glob = ecalloc(1, sizeof *glob);
+void sigchld(int unused) {
+  (void)unused;
 
-  glob->conn = xcb_connect(NULL, NULL);
+  while (waitpid(-1, NULL, WNOHANG) > 0)
+    ;
+}
+
+void sigterm(int unused) {
+  (void)unused;
+  cleanup();
+  exit(0);
+}
+
+xcb_atom_t getatom(const char *restrict name) {
+  xcb_intern_atom_cookie_t cookie;
+  xcb_intern_atom_reply_t *reply;
+  xcb_atom_t atom;
+
+  cookie = xcb_intern_atom(glob->conn, 0, strlen(name), name);
+  reply = xcb_intern_atom_reply(glob->conn, cookie, NULL);
+
+  if (!reply)
+    die("xcb_intern_atom_reply");
+
+  atom = reply->atom;
+  free(reply);
+
+  return atom;
+}
+
+client *getclient(xcb_window_t win) {
+  client *c;
+
+  for (c = glob->clients; c; c = c->next)
+    if (c->win == win)
+      return c;
+
+  return NULL;
+}
+
+void manage(xcb_window_t win) {
+  client *c;
+  xcb_get_window_attributes_cookie_t cookie;
+  xcb_get_window_attributes_reply_t *attrs;
+
+  if (getclient(win))
+    return;
+
+  cookie = xcb_get_window_attributes(glob->conn, win);
+  attrs = xcb_get_window_attributes_reply(glob->conn, cookie, NULL);
+
+  if (!attrs)
+    return;
+
+  if (attrs->override_redirect) {
+    free(attrs);
+    return;
+  }
+
+  free(attrs);
+
+  c = ecalloc(1, sizeof *c);
+  c->win = win;
+  c->next = glob->clients;
+  glob->clients = c;
+}
+
+void unmanage(xcb_window_t win) {
+  client **c;
+
+  for (c = &glob->clients; *c; c = &(*c)->next) {
+    if ((*c)->win == win) {
+      client *tmp = *c;
+      *c = (*c)->next;
+      free(tmp);
+      return;
+    }
+  }
+}
+
+void setup(void) {
+  struct sigaction sa;
+
+  glob = ecalloc(1, sizeof *glob);
+  glob->conn = xcb_connect(NULL, &glob->screen_no);
 
   if (!glob->conn || xcb_connection_has_error(glob->conn))
     die("Failed to connect to X server");
 
   glob->screen = xcb_setup_roots_iterator(xcb_get_setup(glob->conn)).data;
+
+  glob->atoms.wm_protocols = getatom("WM_PROTOCOLS");
+  glob->atoms.wm_delete = getatom("WM_DELETE_WINDOW");
+  glob->atoms.net_active_window = getatom("_NET_ACTIVE_WINDOW");
+  glob->atoms.net_supported = getatom("_NET_SUPPORTED");
+
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = sigchld;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+  sigaction(SIGCHLD, &sa, NULL);
+
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = sigterm;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+
+  handler[XCB_MAP_REQUEST] = (void (*)(xcb_generic_event_t *))maprequest;
+  handler[XCB_CONFIGURE_REQUEST] =
+      (void (*)(xcb_generic_event_t *))configurerequest;
+  handler[XCB_DESTROY_NOTIFY] = (void (*)(xcb_generic_event_t *))destroynotify;
+  handler[XCB_UNMAP_NOTIFY] = (void (*)(xcb_generic_event_t *))unmapnotify;
 
   xcb_flush(glob->conn);
 }
@@ -81,17 +218,85 @@ void scan(void) {
     die("another window manager is already running");
 }
 
+void startupscan(void) {
+  xcb_query_tree_cookie_t cookie;
+  xcb_query_tree_reply_t *reply;
+  xcb_window_t *wins;
+  int len;
+  int i;
+
+  cookie = xcb_query_tree(glob->conn, glob->screen->root);
+  reply = xcb_query_tree_reply(glob->conn, cookie, NULL);
+
+  if (!reply)
+    return;
+
+  wins = xcb_query_tree_children(reply);
+  len = xcb_query_tree_children_length(reply);
+
+  for (i = 0; i < len; i++)
+    manage(wins[i]);
+
+  free(reply);
+}
+
+void maprequest(xcb_map_request_event_t *e) {
+  manage(e->window);
+  xcb_map_window(glob->conn, e->window);
+}
+
+void configurerequest(xcb_configure_request_event_t *e) {
+  uint32_t values[7];
+  uint32_t i = 0;
+
+  if (e->value_mask & XCB_CONFIG_WINDOW_X)
+    values[i++] = e->x;
+  if (e->value_mask & XCB_CONFIG_WINDOW_Y)
+    values[i++] = e->y;
+  if (e->value_mask & XCB_CONFIG_WINDOW_WIDTH)
+    values[i++] = e->width;
+  if (e->value_mask & XCB_CONFIG_WINDOW_HEIGHT)
+    values[i++] = e->height;
+  if (e->value_mask & XCB_CONFIG_WINDOW_BORDER_WIDTH)
+    values[i++] = e->border_width;
+  if (e->value_mask & XCB_CONFIG_WINDOW_SIBLING)
+    values[i++] = e->sibling;
+  if (e->value_mask & XCB_CONFIG_WINDOW_STACK_MODE)
+    values[i++] = e->stack_mode;
+
+  xcb_configure_window(glob->conn, e->window, e->value_mask, values);
+}
+
+void destroynotify(xcb_destroy_notify_event_t *e) { unmanage(e->window); }
+
+void unmapnotify(xcb_unmap_notify_event_t *e) { unmanage(e->window); }
+
 void run(void) {
   xcb_generic_event_t *ev;
+  uint8_t type;
 
   while ((ev = xcb_wait_for_event(glob->conn))) {
-		switch(ev->response_type & ~0x80) {
-			case XCB_MAP_REQUEST: {
-				maprequest((xcb_map_request_event_t *)ev);
-			} break;
-		}
-		free(ev);
-	}
+    type = EVENTTYPE(ev);
+
+    if (handler[type])
+      handler[type](ev);
+
+    free(ev);
+    xcb_flush(glob->conn);
+  }
+}
+
+void cleanup(void) {
+  client *c;
+  client *next;
+
+  for (c = glob->clients; c; c = next) {
+    next = c->next;
+    free(c);
+  }
+
+  xcb_disconnect(glob->conn);
+  free(glob);
 }
 
 int main(int argc, char **argv) {
@@ -100,12 +305,20 @@ int main(int argc, char **argv) {
   else if (argc != 1)
     die("usage: fork [-v]");
 
-  setup();
-  scan();
-  run();
+  if (!setlocale(LC_CTYPE, ""))
+    die("warning: no locale support");
 
-  xcb_disconnect(glob->conn);
-  free(glob);
+  setup();
+
+#ifdef __OpenBSD__
+  if (pledge("stdio rpath proc exec", NULL) == -1)
+    die("pledge");
+#endif
+
+  scan();
+  startupscan();
+  run();
+  cleanup();
 
   return 0;
 }
