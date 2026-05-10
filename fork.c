@@ -1,4 +1,3 @@
-#include <X11/keysym.h>
 #include <errno.h>
 #include <locale.h>
 #include <signal.h>
@@ -12,6 +11,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
 #include <xcb/xproto.h>
+#include <X11/keysym.h>
 
 #define VERSION "0.1.0"
 #define EVENTTYPE(e) ((e)->response_type & ~0x80)
