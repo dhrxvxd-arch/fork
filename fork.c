@@ -30,6 +30,7 @@
 typedef struct client {
   xcb_window_t win;
   struct client *next;
+  int fullscreen;
 } client;
 
 typedef struct atoms {
@@ -37,6 +38,13 @@ typedef struct atoms {
   xcb_atom_t wm_delete;
   xcb_atom_t net_active_window;
   xcb_atom_t net_supported;
+  xcb_atom_t net_wm_state;
+  xcb_atom_t net_wm_state_fullscreen;
+  xcb_atom_t net_wm_state_maximized_horz;
+  xcb_atom_t net_wm_state_maximized_vert;
+  xcb_atom_t net_client_list;
+  xcb_atom_t net_current_desktop;
+  xcb_atom_t net_number_of_desktops;
 } atoms;
 
 typedef struct global {
@@ -83,7 +91,13 @@ static xcb_atom_t getatom(const char *restrict name);
 static client *getclient(xcb_window_t win);
 static void manage(xcb_window_t win);
 static void unmanage(xcb_window_t win);
+static void tile(void);
+static void monocle(void);
+static void fullscreen(client *c);
+static void setfullscreen(xcb_window_t win, int enable);
+static void togglefullscreen(const arg *a);
 static void focus(client *c);
+static void arrange(const arg *args);
 static void maprequest(xcb_map_request_event_t *e);
 static void configurerequest(xcb_configure_request_event_t *e);
 static void destroynotify(xcb_destroy_notify_event_t *e);
@@ -96,8 +110,13 @@ static const char *termcmd[] = {"alacritty", NULL};
 
 #define ModMask XCB_MOD_MASK_4
 
+enum { LAYOUT_TILE, LAYOUT_MONOCLE };
+
 static const key keys[] = {
     {ModMask, XK_Return, spawn, {.v = termcmd}},
+    {ModMask, XK_t, arrange, {.i = LAYOUT_TILE}},
+    {ModMask, XK_m, arrange, {.i = LAYOUT_MONOCLE}},
+    {ModMask, XK_space, togglefullscreen, {0}},
 };
 
 static _Noreturn void die(const char *fmt, ...) {
@@ -327,6 +346,13 @@ static void setup(void) {
   glob->atoms.wm_delete = getatom("WM_DELETE_WINDOW");
   glob->atoms.net_active_window = getatom("_NET_ACTIVE_WINDOW");
   glob->atoms.net_supported = getatom("_NET_SUPPORTED");
+  glob->atoms.net_wm_state = getatom("_NET_WM_STATE");
+  glob->atoms.net_wm_state_fullscreen = getatom("_NET_WM_STATE_FULLSCREEN");
+  glob->atoms.net_wm_state_maximized_horz = getatom("_NET_WM_STATE_MAXIMIZED_HORZ");
+  glob->atoms.net_wm_state_maximized_vert = getatom("_NET_WM_STATE_MAXIMIZED_VERT");
+  glob->atoms.net_client_list = getatom("_NET_CLIENT_LIST");
+  glob->atoms.net_current_desktop = getatom("_NET_CURRENT_DESKTOP");
+  glob->atoms.net_number_of_desktops = getatom("_NET_NUMBER_OF_DESKTOPS");
 
   glob->syms = xcb_key_symbols_alloc(glob->conn);
 
@@ -406,6 +432,124 @@ static void startupscan(void) {
   free(reply);
 }
 
+static void fullscreen(client *c) {
+  uint32_t v[4];
+
+  v[0] = 0;
+  v[1] = 0;
+  v[2] = glob->screen->width_in_pixels;
+  v[3] = glob->screen->height_in_pixels;
+
+  xcb_configure_window(
+    glob->conn,
+    c->win,
+    XCB_CONFIG_WINDOW_X |
+    XCB_CONFIG_WINDOW_Y |
+    XCB_CONFIG_WINDOW_WIDTH |
+    XCB_CONFIG_WINDOW_HEIGHT,
+    v
+  );
+}
+
+static void setfullscreen(xcb_window_t win, int enable) {
+  xcb_client_message_event_t ev;
+
+  memset(&ev, 0, sizeof(ev));
+
+  ev.response_type = XCB_CLIENT_MESSAGE;
+  ev.window = win;
+  ev.type = glob->atoms.net_wm_state;
+  ev.format = 32;
+
+  ev.data.data32[0] = enable;
+  ev.data.data32[1] = glob->atoms.net_wm_state_fullscreen;
+  ev.data.data32[2] = XCB_NONE;
+  ev.data.data32[3] = 0;
+  ev.data.data32[4] = 0;
+
+  xcb_send_event(glob->conn, 0, glob->screen->root,
+                 XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
+                     XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+                 (char *)&ev);
+
+  xcb_flush(glob->conn);
+}
+
+static void togglefullscreen(const arg *a) {
+  (void)a;
+  client *c;
+
+  if (!(c = glob->sel))
+    return;
+
+  c->fullscreen = !c->fullscreen;
+
+  setfullscreen(c->win, c->fullscreen);
+
+  focus(c);
+}
+
+static void tile(void) {
+  client *c;
+  int n = 0;
+
+  for (c = glob->clients; c; c = c->next)
+    n++;
+
+  if (!n)
+    return;
+
+  int sw = glob->screen->width_in_pixels;
+  int sh = glob->screen->height_in_pixels;
+
+  int masterw = (n == 1) ? sw : sw * 0.6;
+  int stackw = sw - masterw;
+
+  int i = 0;
+  int y = 0;
+
+  for (c = glob->clients; c; c = c->next, i++) {
+    uint32_t v[4];
+
+    if (i == 0) {
+      v[0] = 0;
+      v[1] = 0;
+      v[2] = masterw;
+      v[3] = sh;
+    } else {
+      int h = sh / (n - 1);
+
+      v[0] = masterw;
+      v[1] = y;
+      v[2] = stackw;
+      v[3] = h;
+
+      y += h;
+    }
+
+    xcb_configure_window(
+      glob->conn,
+      c->win,
+      XCB_CONFIG_WINDOW_X |
+      XCB_CONFIG_WINDOW_Y |
+      XCB_CONFIG_WINDOW_WIDTH |
+      XCB_CONFIG_WINDOW_HEIGHT,
+      v
+    );
+  }
+
+  xcb_flush(glob->conn);
+}
+
+static void monocle(void) {
+  client *c;
+
+  for (c = glob->clients; c; c = c->next)
+    fullscreen(c);
+
+  xcb_flush(glob->conn);
+}
+
 static void focus(client *c) {
   if (!c || glob->sel == c)
     return;
@@ -415,7 +559,25 @@ static void focus(client *c) {
   xcb_set_input_focus(glob->conn, XCB_INPUT_FOCUS_POINTER_ROOT, c->win,
                       XCB_CURRENT_TIME);
 
+  uint32_t v = XCB_STACK_MODE_ABOVE;
+
+  xcb_configure_window(glob->conn, c->win, XCB_CONFIG_WINDOW_STACK_MODE, &v);
+
   xcb_flush(glob->conn);
+}
+
+static void arrange(const arg *args) {
+  if (!args)
+    return;
+
+  switch (args->i) {
+  case 0:
+    tile();
+    break;
+  case 1:
+    monocle();
+    break;
+  }
 }
 
 static void maprequest(xcb_map_request_event_t *e) {
