@@ -48,7 +48,7 @@ clean:
 	rm -f fork $(OBJ) $(OBJ:.o=.d)
 
 run:
-	startx ./xinitrc --
+	xinit ./fork
 
 -include $(OBJ:.o=.d)
 
