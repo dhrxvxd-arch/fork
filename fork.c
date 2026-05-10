@@ -1,3 +1,4 @@
+#include <X11/keysym.h>
 #include <errno.h>
 #include <locale.h>
 #include <signal.h>
@@ -6,14 +7,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <xcb/xcb.h>
+#include <xcb/xcb_keysyms.h>
 #include <xcb/xproto.h>
 
 #define VERSION "0.1.0"
 #define EVENTTYPE(e) ((e)->response_type & ~0x80)
-#define ModMask XCB_MOD_MASK_4
+#define LENGTH(X) (sizeof(X) / sizeof(X)[0])
 
 typedef struct client {
   xcb_window_t win;
@@ -30,26 +32,36 @@ typedef struct atoms {
 typedef struct global {
   int screen_no;
   atoms atoms;
-	client *sel;
+  client *sel;
   client *clients;
   xcb_connection_t *conn;
   xcb_screen_t *screen;
+  xcb_key_symbols_t *syms;
 } global;
 
 global *glob;
 
 typedef union {
-	int i;
-	unsigned int ui;
-	float f;
-	const void *v;
+  int i;
+  unsigned int ui;
+  float f;
+  const void *v;
 } arg;
+
+typedef struct key {
+  uint16_t mod;
+  xcb_keysym_t keysym;
+  void (*func)(const arg *);
+  const arg arg;
+} key;
 
 static void (*handler[256])(xcb_generic_event_t *);
 
 _Noreturn void die(const char *fmt, ...);
 void *ecalloc(size_t nmemb, size_t size);
 void spawn(const arg *args);
+void keypress(xcb_key_press_event_t *e);
+void grabkeys(void);
 void setup(void);
 void scan(void);
 void sigchld(int unused);
@@ -68,6 +80,14 @@ void enternotify(xcb_enter_notify_event_t *e);
 void run(void);
 void cleanup(void);
 int main(int argc, char **argv);
+
+static const char *termcmd[] = {"alacritty", NULL};
+
+#define ModMask XCB_MOD_MASK_4
+
+static const key keys[] = {
+    {ModMask, XK_Return, spawn, {.v = termcmd}},
+};
 
 _Noreturn void die(const char *fmt, ...) {
   va_list ap;
@@ -96,8 +116,8 @@ void spawn(const arg *args) {
   struct sigaction sa;
 
   if (!fork()) {
-		if (glob->conn)
-			close(xcb_get_file_descriptor(glob->conn));
+    if (glob->conn)
+      close(xcb_get_file_descriptor(glob->conn));
     setsid();
 
     sigemptyset(&sa.sa_mask);
@@ -107,6 +127,37 @@ void spawn(const arg *args) {
 
     execvp(*((char **)args->v), (char **)args->v);
     die("fork: execvp '%s' failed:", *((char **)args->v));
+  }
+}
+
+void keypress(xcb_key_press_event_t *e) {
+  xcb_keysym_t sym;
+  unsigned int i;
+
+  sym = xcb_key_symbols_get_keysym(glob->syms, e->detail, 0);
+
+  for (i = 0; i < LENGTH(keys); i++)
+    if (sym == keys[i].keysym && e->state == keys[i].mod && keys[i].func)
+      keys[i].func(&(keys[i].arg));
+}
+
+void grabkeys(void) {
+  xcb_keycode_t *codes;
+  unsigned int i;
+  int j;
+
+  xcb_ungrab_key(glob->conn, XCB_GRAB_ANY, glob->screen->root,
+                 XCB_MOD_MASK_ANY);
+
+  for (i = 0; i < LENGTH(keys); i++) {
+    if (!(codes = xcb_key_symbols_get_keycode(glob->syms, keys[i].keysym)))
+      continue;
+
+    for (j = 0; codes[j] != XCB_NO_SYMBOL; j++)
+      xcb_grab_key(glob->conn, 1, glob->screen->root, keys[i].mod, codes[j],
+                   XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
+
+    free(codes);
   }
 }
 
@@ -224,7 +275,10 @@ void setup(void) {
       (void (*)(xcb_generic_event_t *))configurerequest;
   handler[XCB_DESTROY_NOTIFY] = (void (*)(xcb_generic_event_t *))destroynotify;
   handler[XCB_UNMAP_NOTIFY] = (void (*)(xcb_generic_event_t *))unmapnotify;
-	handler[XCB_ENTER_NOTIFY] = (void (*)(xcb_generic_event_t *))enternotify;
+  handler[XCB_ENTER_NOTIFY] = (void (*)(xcb_generic_event_t *))enternotify;
+  handler[XCB_KEY_PRESS] = (void (*)(xcb_generic_event_t *))keypress;
+
+  glob->syms = xcb_key_symbols_alloc(glob->conn);
 
   xcb_flush(glob->conn);
 }
@@ -284,11 +338,11 @@ void focus(client *c) {
 }
 
 void maprequest(xcb_map_request_event_t *e) {
-	client *c; 
+  client *c;
   manage(e->window);
   xcb_map_window(glob->conn, e->window);
-	if ((c = getclient(e->window)))
-		focus(c);
+  if ((c = getclient(e->window)))
+    focus(c);
 }
 
 void configurerequest(xcb_configure_request_event_t *e) {
@@ -313,13 +367,9 @@ void configurerequest(xcb_configure_request_event_t *e) {
   xcb_configure_window(glob->conn, e->window, e->value_mask, values);
 }
 
-void destroynotify(xcb_destroy_notify_event_t *e) { 
-	unmanage(e->window); 
-}
+void destroynotify(xcb_destroy_notify_event_t *e) { unmanage(e->window); }
 
-void unmapnotify(xcb_unmap_notify_event_t *e) {
-	unmanage(e->window);
-}
+void unmapnotify(xcb_unmap_notify_event_t *e) { unmanage(e->window); }
 
 void enternotify(xcb_enter_notify_event_t *e) {
   client *c;
@@ -373,6 +423,7 @@ int main(int argc, char **argv) {
 #endif
 
   scan();
+  grabkeys();
   startupscan();
   run();
   cleanup();
